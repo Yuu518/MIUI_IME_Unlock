@@ -1,8 +1,13 @@
 package com.xposed.miuiime
 
+import android.annotation.TargetApi
 import android.content.Context
 import android.os.Binder
+import android.os.Build
 import android.provider.Settings
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowInsets
 import android.view.inputmethod.InputMethodManager
 import com.github.kyuubiran.ezxhelper.init.EzXHelperInit
 import com.github.kyuubiran.ezxhelper.utils.Log
@@ -23,8 +28,35 @@ import dalvik.system.BaseDexClassLoader
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import org.luckypray.dexkit.DexKitBridge
+import java.lang.reflect.Method
 
 private const val TAG = "miuiime"
+private const val EDGE_TO_EDGE_TARGET_SDK = 35
+private const val LEGACY_BOTTOM_MARGIN_TARGET_SDK = EDGE_TO_EDGE_TARGET_SDK - 1
+private const val BOTTOM_AREA_INSET_RETRY_DELAY_MILLIS = 200L
+
+internal fun shouldApplyBottomAreaInsetFix(deviceSdkVersion: Int, imeTargetSdkVersion: Int): Boolean =
+    deviceSdkVersion >= EDGE_TO_EDGE_TARGET_SDK &&
+        imeTargetSdkVersion >= EDGE_TO_EDGE_TARGET_SDK
+
+internal fun resolveBottomMarginTargetSdk(deviceSdkVersion: Int, imeTargetSdkVersion: Int): Int =
+    if (shouldApplyBottomAreaInsetFix(deviceSdkVersion, imeTargetSdkVersion)) {
+        LEGACY_BOTTOM_MARGIN_TARGET_SDK
+    } else {
+        imeTargetSdkVersion
+    }
+
+internal fun resolveBottomAreaTranslationY(
+    isNavigationHandleShown: Boolean,
+    navigationInsetBottom: Int?,
+    bottomAreaOverflow: Int?,
+): Float? {
+    if (!isNavigationHandleShown) return 0f
+    val navigationInset = navigationInsetBottom?.coerceAtLeast(0) ?: return null
+    val availableOverflow = bottomAreaOverflow?.coerceAtLeast(0) ?: return null
+    val safeTranslation = minOf(navigationInset, availableOverflow)
+    return -safeTranslation.toFloat()
+}
 
 class MainHook : IXposedHookLoadPackage {
     private val miuiImeList: List<String> = listOf(
@@ -34,6 +66,7 @@ class MainHook : IXposedHookLoadPackage {
         "com.miui.catcherpatch",
         "com.xiaomi.type",
     )
+    private val hookedBottomManagerClasses = mutableSetOf<Class<*>>()
     private var navBarColor: Int? = null
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -76,39 +109,53 @@ class MainHook : IXposedHookLoadPackage {
         }.hookBefore { param ->
             val loader = param.args[0] as ClassLoader
             val dexPath = param.args[1] as String
-            // 系统原始逻辑，若已加载dex则直接返回，避免重复hook
+            // 已加载时复用现有类，否则先添加动态模块的 dex 路径。
             if (loader !is BaseDexClassLoader) throw NoSuchMethodException("addDexPath method not found.")
-            runCatching {
+            val bottomManagerClass = runCatching {
                 Class.forName("com.miui.inputmethod.InputMethodBottomManager", true, loader)
-                param.result = null
-                return@hookBefore
+            }.getOrNull() ?: run {
+                loader.invokeMethodAuto("addDexPath", dexPath)
+                loadClassOrNull("com.miui.inputmethod.InputMethodBottomManager", loader)
             }
-            loader.invokeMethodAuto("addDexPath", dexPath)
 
-            hookDeleteNotSupportIme(
-                "com.miui.inputmethod.InputMethodBottomManager\$MiuiSwitchInputMethodListener",
-                loader
-            )
-            loadClassOrNull(
-                "com.miui.inputmethod.InputMethodBottomManager",
-                loader
-            )?.also {
+            if (bottomManagerClass == null) {
+                Log.e("Failed:Class not found: com.miui.inputmethod.InputMethodBottomManager")
+            } else if (markBottomManagerClassHooked(bottomManagerClass)) {
+                hookDeleteNotSupportIme(
+                    "com.miui.inputmethod.InputMethodBottomManager\$MiuiSwitchInputMethodListener",
+                    loader
+                )
+
+                val clazz = bottomManagerClass
                 if (isNonCustomize) {
-                    hookSIsImeSupport(it)
-                    hookIsXiaoAiEnable(it)
+                    hookSIsImeSupport(clazz)
+                    hookIsXiaoAiEnable(clazz)
+                    if (shouldApplyBottomAreaInsetFix(
+                            Build.VERSION.SDK_INT,
+                            lpparam.appInfo.targetSdkVersion,
+                        )
+                    ) {
+                        hookLegacyBottomMargin(clazz)
+                        hookBottomAreaNavigationInset(clazz)
+                    }
                 }
 
                 // 针对A11的修复切换输入法列表
-                it.getDeclaredMethod("getSupportIme").hookReplace { _ ->
-                    it.getStaticObject("sBottomViewHelper")
+                clazz.getDeclaredMethod("getSupportIme").hookReplace { _ ->
+                    clazz.getStaticObject("sBottomViewHelper")
                         .getObjectAs<InputMethodManager>("mImm").enabledInputMethodList
                 }
-            } ?: Log.e("Failed:Class not found: com.miui.inputmethod.InputMethodBottomManager")
+            }
             param.result = null
         }
 
         Log.i("Hook MIUI IME Done!")
     }
+
+    private fun markBottomManagerClassHooked(clazz: Class<*>): Boolean =
+        synchronized(hookedBottomManagerClasses) {
+            hookedBottomManagerClasses.add(clazz)
+        }
 
     /**
      * 跳过包名检查，直接开启输入法优化
@@ -135,6 +182,112 @@ class MainHook : IXposedHookLoadPackage {
             clazz.getMethod("isXiaoAiEnable").hookReturnConstant(false)
         }.onFailure {
             Log.i("Failed:Hook method isXiaoAiEnable")
+            Log.i(it)
+        }
+    }
+
+    /**
+     * HyperOS 4 no longer removes the gesture-area remainder for target SDK 35+ IMEs.
+     * Non-customized IMEs enabled by this module still use the legacy layout, so keep
+     * this single vendor layout check on its pre-edge-to-edge path.
+     *
+     * @param clazz com.miui.inputmethod.InputMethodBottomManager
+     */
+    private fun hookLegacyBottomMargin(clazz: Class<*>) {
+        kotlin.runCatching {
+            clazz.getDeclaredMethod("getTargetSdkVersion", Context::class.java).hookAfter { param ->
+                val targetSdkVersion = param.result as? Int ?: return@hookAfter
+                val resolvedTargetSdkVersion = resolveBottomMarginTargetSdk(
+                    Build.VERSION.SDK_INT,
+                    targetSdkVersion
+                )
+                if (resolvedTargetSdkVersion != targetSdkVersion) {
+                    param.result = resolvedTargetSdkVersion
+                }
+            }
+            Log.i("Success:Hook HyperOS 4 bottom margin")
+        }.onFailure {
+            Log.i("Failed:Hook HyperOS 4 bottom margin")
+            Log.i(it)
+        }
+    }
+
+    /**
+     * Target SDK 35+ IMEs already reserve the gesture navigation inset. Move the
+     * MIUI bottom area over that reserved space, capped by the vendor-computed
+     * applied bottom margin so its background still reaches the bottom of the window.
+     *
+     * @param clazz com.miui.inputmethod.InputMethodBottomManager
+     */
+    private fun hookBottomAreaNavigationInset(clazz: Class<*>) {
+        kotlin.runCatching {
+            val inputMethodUtilClass = Class.forName(
+                "com.miui.inputmethod.InputMethodUtil",
+                false,
+                clazz.classLoader,
+            )
+            val isShowNavigationHandleMethod = inputMethodUtilClass
+                .getDeclaredMethod("isShowNavigationHandle").apply {
+                isAccessible = true
+            }
+
+            clazz.getDeclaredMethod("setMiuiBottomMargin", Context::class.java).hookAfter {
+                kotlin.runCatching {
+                    val bottomArea = clazz.getStaticObject("sBottomViewHelper")
+                        .getObjectAs<View>("mMiuiBottomArea")
+                    applyBottomAreaNavigationInset(
+                        bottomArea,
+                        isShowNavigationHandleMethod,
+                    )
+                    bottomArea.post {
+                        applyBottomAreaNavigationInset(
+                            bottomArea,
+                            isShowNavigationHandleMethod,
+                        )
+                    }
+                    // Some IMEs can run the first posted callback before their window
+                    // receives navigation-bar insets. Retry once after initial layout.
+                    bottomArea.postDelayed({
+                        applyBottomAreaNavigationInset(
+                            bottomArea,
+                            isShowNavigationHandleMethod,
+                        )
+                    }, BOTTOM_AREA_INSET_RETRY_DELAY_MILLIS)
+                }.onFailure {
+                    Log.i("Failed:Apply HyperOS 4 bottom area inset")
+                    Log.i(it)
+                }
+            }
+            Log.i("Success:Hook HyperOS 4 bottom area inset")
+        }.onFailure {
+            Log.i("Failed:Hook HyperOS 4 bottom area inset")
+            Log.i(it)
+        }
+    }
+
+    @TargetApi(Build.VERSION_CODES.R)
+    private fun applyBottomAreaNavigationInset(
+        bottomArea: View,
+        isShowNavigationHandleMethod: Method,
+    ) {
+        kotlin.runCatching {
+            val isNavigationHandleShown = isShowNavigationHandleMethod.invoke(null) as Boolean
+            val navigationInsetBottom = bottomArea.rootWindowInsets
+                ?.getInsets(WindowInsets.Type.navigationBars())
+                ?.bottom
+            val bottomAreaOverflow = (bottomArea.layoutParams as? ViewGroup.MarginLayoutParams)
+                ?.bottomMargin
+                ?.let { bottomMargin ->
+                    (-bottomMargin.toLong()).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+                }
+            val translationY = resolveBottomAreaTranslationY(
+                isNavigationHandleShown,
+                navigationInsetBottom,
+                bottomAreaOverflow,
+            ) ?: return@runCatching
+            bottomArea.translationY = translationY
+        }.onFailure {
+            Log.i("Failed:Apply HyperOS 4 bottom area inset")
             Log.i(it)
         }
     }

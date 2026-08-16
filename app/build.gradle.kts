@@ -57,4 +57,5 @@ dependencies {
     compileOnly("de.robv.android.xposed:api:82")
     implementation("com.github.kyuubiran:EzXHelper:1.0.3")
     implementation("org.luckypray:dexkit:2.2.0")
+    testImplementation("junit:junit:4.13.2")
 }
